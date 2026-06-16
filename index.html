@@ -26,7 +26,7 @@
 <body>
 <div id="wrapper"><canvas id="game"></canvas></div>
 <script>
-const VERSION = '3.0.0';
+const VERSION = '3.1.0';
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 
@@ -160,29 +160,32 @@ let droneBullets = [], lightningArcs = [];
 const keys = {};
 let touchX = null, touchY = null, touchShooting = false;
 let shootCooldown = 0, bombCooldown = 0, missileCooldown = 0;
-let spaceHeld = 0;
+let chargeHeld = 0, blinkCooldown = 0, overdriveTimer = 0;
+let blinkFx = [];
 
 document.addEventListener('keydown', e => {
   const wasDown = keys[e.code];
   keys[e.code] = true;
-  const prev = ['Space','KeyZ','ArrowUp','ArrowDown','ArrowLeft','ArrowRight',
-                 'KeyW','KeyA','KeyS','KeyD','KeyX','ShiftLeft','KeyP','Escape'];
+  const prev = ['Space','KeyZ','KeyV','KeyC','ArrowUp','ArrowDown','ArrowLeft','ArrowRight',
+                 'KeyW','KeyA','KeyS','KeyD','KeyX','ShiftLeft','ShiftRight','KeyP','Escape'];
   if (prev.includes(e.code)) e.preventDefault();
   if (!wasDown) {
-    if ((e.code === 'Space' || e.code === 'KeyZ') && state !== 'play') { initAudio(); startGame(); }
-    if ((e.code === 'KeyX' || e.code === 'ShiftLeft') && state === 'play') {
-      if (player.laserCharge >= 100 && !player.laserFiring) fireLaser();
-      else useBomb();
+    // start / restart
+    if ((e.code === 'Space' || e.code === 'KeyV' || e.code === 'KeyZ') && state !== 'play') { initAudio(); startGame(); return; }
+    if (state === 'play') {
+      if (e.code === 'KeyX') doBlink();                                   // X = ブリンク回避
+      if (e.code === 'KeyZ') fireSpecial();                              // Z = 必殺技 OVERDRIVE
+      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') useBomb();  // Shift = ボム
+      if (e.code === 'KeyP' || e.code === 'Escape') togglePause();
     }
-    if ((e.code === 'KeyP' || e.code === 'Escape') && state === 'play') togglePause();
   }
 });
 document.addEventListener('keyup', e => {
   const wasDown = keys[e.code];
   keys[e.code] = false;
-  if ((e.code === 'Space' || e.code === 'KeyZ') && wasDown && state === 'play') {
-    if (spaceHeld > 30) fireChargeShot();
-    spaceHeld = 0;
+  if (e.code === 'KeyC' && wasDown && state === 'play') {                // C を離すとチャージショット発射
+    if (chargeHeld > 25) fireChargeShot();
+    chargeHeld = 0;
   }
 });
 
@@ -225,9 +228,10 @@ function startGame() {
   bossActive = false; nextBossScore = 2000; stageNum = 1;
   shake = 0; flashAlpha = 0; warningSent = false;
   grazeScore = 0; totalGraze = 0; totalShots = 0; totalHits = 0;
-  slowTime = 0; chainActive = 0; spaceHeld = 0; screenTilt = 0;
+  slowTime = 0; chainActive = 0; chargeHeld = 0; screenTilt = 0;
+  blinkCooldown = 0; overdriveTimer = 0;
   bullets = []; eBullets = []; enemies = []; boss = null; powerUps = [];
-  particles = []; comboTexts = []; laserBeam = null; droneBullets = []; lightningArcs = [];
+  particles = []; comboTexts = []; laserBeam = null; droneBullets = []; lightningArcs = []; blinkFx = [];
   player.x = W/2; player.y = H-90;
   player.invincible = 140; player.powerLevel = 0;
   player.shieldHp = 0; player.laserCharge = 0; player.laserFiring = false;
@@ -497,9 +501,10 @@ function fireBullets() {
   if (player.hasChain && frame%8===0) fireChainLightning(player.x, player.y-player.h/2);
 }
 
+// C を離して発射するチャージショット
 function fireChargeShot() {
   if (state !== 'play' || paused) return;
-  const power = Math.min(spaceHeld / 90, 1);
+  const power = Math.min(chargeHeld / 90, 1);
   if (power < 0.3) return;
   sndChargeShot();
   totalShots++;
@@ -507,18 +512,63 @@ function fireChargeShot() {
   const size = 6 + power * 20;
   bullets.push({ x:player.x, y:player.y-player.h/2, vx:0, vy:-18, w:size, h:size*2, color:'#fff', dmg, charge:true, glow:size });
   screenFlash('#fff', 0.25);
-  for (let i = 0; i < 12; i++) {
+  // full-charge fires a piercing trio
+  if (power >= 1) {
+    [-22, 22].forEach(ox => bullets.push({ x:player.x+ox, y:player.y-player.h/2, vx:0, vy:-17, w:size*0.7, h:size*1.4, color:'#0ff', dmg:Math.floor(dmg*0.6), charge:true, glow:size*0.7 }));
+  }
+  for (let i = 0; i < 14; i++) {
     const a = Math.random()*Math.PI*2;
     particles.push({ x:player.x, y:player.y, vx:Math.cos(a)*4, vy:Math.sin(a)*4-2, life:20, maxLife:20, color:'#0ff', size:3, type:'spark' });
   }
 }
 
-function fireLaser() {
-  if (player.laserCharge < 100 || player.laserFiring) return;
-  player.laserFiring = true; player.laserCharge = 0;
-  sndLaser();
-  laserBeam = { x:player.x, y:player.y, life:60, maxLife:60 };
-  screenFlash('#f00', 0.3);
+// X = BLINK: 短距離瞬間移動で弾を回避し、着地点の弾を消し飛ばす
+function doBlink() {
+  if (blinkCooldown > 0 || state !== 'play' || paused) return;
+  blinkCooldown = 75;
+  const oldX = player.x, oldY = player.y;
+  let dx = 0, dy = 0;
+  if (keys['ArrowLeft']||keys['KeyA'])  dx -= 1;
+  if (keys['ArrowRight']||keys['KeyD']) dx += 1;
+  if (keys['ArrowUp']||keys['KeyW'])    dy -= 1;
+  if (keys['ArrowDown']||keys['KeyS'])  dy += 1;
+  if (dx===0 && dy===0) dy = -1; // 入力なしなら上へ
+  const len = Math.hypot(dx,dy)||1, dist = 135;
+  player.x = clamp(player.x + dx/len*dist, player.w/2, W-player.w/2);
+  player.y = clamp(player.y + dy/len*dist, 40, H-player.h/2);
+  player.invincible = Math.max(player.invincible, 26);
+  sndTeleport(); screenFlash('#a0f', 0.22);
+  // 着地点の敵弾を消し飛ばす衝撃波
+  let cleared = 0;
+  eBullets = eBullets.filter(b => {
+    if (Math.hypot(b.x-player.x, b.y-player.y) < 78) {
+      particles.push({ x:b.x, y:b.y, vx:randn(3), vy:randn(3), life:14, maxLife:14, color:'#a0f', size:3, type:'spark' });
+      cleared++; return false;
+    }
+    return true;
+  });
+  if (cleared > 0) { const pts = cleared*15; score += pts; addComboText(player.x, player.y-32, `BLINK +${pts}`, '#a0f'); }
+  blinkFx.push({ x1:oldX, y1:oldY, x2:player.x, y2:player.y, life:18, maxLife:18 });
+  particles.push({ x:player.x, y:player.y, r:0, maxR:78, life:18, maxLife:18, type:'ring', color:'#a0f' });
+}
+
+// Z = 必殺技 OVERDRIVE: ゲージ満タンで発動。全画面ビーム殲滅＋無敵＋超連射
+function fireSpecial() {
+  if (player.laserCharge < 100 || overdriveTimer > 0 || player.laserFiring) return;
+  player.laserCharge = 0;
+  overdriveTimer = 170;
+  player.laserFiring = true;
+  player.invincible = Math.max(player.invincible, 170);
+  laserBeam = { x:player.x, y:player.y, life:170, maxLife:170, special:true };
+  eBullets = [];
+  sndChargeShot(); sndRankUp();
+  screenShake(28); screenFlash('#fff', 0.95);
+  addComboText(player.x, player.y-46, '★ OVERDRIVE ★', '#0ff');
+  for (let i = 0; i < 60; i++) {
+    const a = (i/60)*Math.PI*2, sp = 3+Math.random()*5;
+    particles.push({ x:player.x, y:player.y, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp, life:40, maxLife:40, color:i%2?'#0ff':'#fff', size:3+Math.random()*3, type:'spark' });
+  }
+  particles.push({ x:player.x, y:player.y, r:0, maxR:W, life:30, maxLife:30, type:'ring', color:'#0ff' });
 }
 
 function fireMissile() {
@@ -626,6 +676,7 @@ function update() {
   if(chainActive>0) chainActive--;
 
   lightningArcs = lightningArcs.filter(a => { a.life--; return a.life>0; });
+  blinkFx = blinkFx.filter(a => { a.life--; return a.life>0; });
 
   if(state!=='play') return;
 
@@ -633,10 +684,10 @@ function update() {
 
   if(comboTimer>0) { comboTimer-=dt; if(comboTimer<=0) { combo=0; multiplier=1; } }
 
-  // Charge shot
-  if (keys['Space'] || keys['KeyZ']) {
-    spaceHeld += dt;
-    if (spaceHeld>10 && spaceHeld%8<1 && spaceHeld<90) sndCharge();
+  // Charge shot (hold C)
+  if (keys['KeyC']) {
+    chargeHeld += dt;
+    if (chargeHeld>10 && chargeHeld%8<1 && chargeHeld<90) sndCharge();
   }
 
   // Movement + tilt
@@ -660,20 +711,26 @@ function update() {
   player.engineFlicker = (player.engineFlicker+1)%8;
   player.droneAngle += 0.045*dt;
 
-  // Laser charge regen
-  if(!player.laserFiring && player.laserCharge<100) player.laserCharge = Math.min(100, player.laserCharge+0.14);
+  // OVERDRIVE gauge passive regen + cooldowns
+  if(!player.laserFiring && player.laserCharge<100) player.laserCharge = Math.min(100, player.laserCharge+0.10);
   if(player.laserFiring) {
     if(laserBeam) laserBeam.life-=dt;
     if(!laserBeam||laserBeam.life<=0) { player.laserFiring=false; laserBeam=null; }
   }
+  if(overdriveTimer>0) {
+    overdriveTimer-=dt;
+    player.invincible = Math.max(player.invincible, 2);
+    if(frame%5===0) eBullets = eBullets.filter(b => Math.hypot(b.x-player.x,b.y-player.y) > 30);
+  }
+  if(blinkCooldown>0) blinkCooldown-=dt;
 
-  // Shoot
+  // Shoot (Space / V), also keep firing during OVERDRIVE
   shootCooldown -= dt;
-  const shooting = (keys['Space']||keys['KeyZ']||touchShooting) && spaceHeld<30;
-  if(shooting && shootCooldown<=0 && !player.laserFiring) {
+  const shooting = (keys['Space']||keys['KeyV']||touchShooting);
+  if(shooting && shootCooldown<=0 && (!player.laserFiring || overdriveTimer>0)) {
     fireBullets();
     if(player.drones>0 && frame%2===0) fireDroneBullets();
-    shootCooldown = Math.max(3, 10-player.powerLevel*1.6);
+    shootCooldown = Math.max(3, (overdriveTimer>0?2:10)-player.powerLevel*1.6);
   }
   if(player.homingMissiles>0 && missileCooldown<=0 && frame%26===0) fireMissile();
 
@@ -693,18 +750,21 @@ function update() {
   // capture AFTER off-screen filter so drone bullet indices into allPB are correct
   const bulletsCount = bullets.length;
 
-  // Laser beam damage
+  // Laser / OVERDRIVE beam damage
   if(laserBeam) {
     laserBeam.x = player.x;
+    const beamW = laserBeam.special ? 58 : 20;
+    const beamDmg = laserBeam.special ? 2.4 : 0.6;
+    const beamCol = laserBeam.special ? '#0ff' : '#f00';
     enemies.forEach(e => {
-      if(Math.abs(e.x-laserBeam.x)<20) {
-        e.hp -= 0.6*dt;
-        if(Math.random()<0.2) particles.push({x:e.x+randn(9),y:e.y,vx:randn(2),vy:randn(2),life:10,maxLife:10,color:'#f00',size:3,type:'spark'});
+      if(Math.abs(e.x-laserBeam.x)<beamW) {
+        e.hp -= beamDmg*dt;
+        if(Math.random()<0.25) particles.push({x:e.x+randn(9),y:e.y,vx:randn(2),vy:randn(2),life:10,maxLife:10,color:beamCol,size:3,type:'spark'});
       }
     });
     enemies = enemies.filter(e => { if(e.hp<=0){registerKill(e.x,e.y,e.scoreVal,false);return false;} return true; });
-    if(boss && Math.abs(boss.x-laserBeam.x)<boss.w/2+10) {
-      if(!boss.shieldBubble||boss.shieldHp<=0) { boss.hp-=1.0*dt; if(boss.hp<=0) killBoss(); }
+    if(boss && Math.abs(boss.x-laserBeam.x)<boss.w/2+beamW-12) {
+      if(!boss.shieldBubble||boss.shieldHp<=0) { boss.hp-=beamDmg*1.4*dt; if(boss.hp<=0) killBoss(); }
     }
   }
 
@@ -924,6 +984,7 @@ function hitTest(a, b, margin) {
 function registerKill(x, y, val, big) {
   combo++; comboTimer=160;
   multiplier = 1 + Math.floor(combo/5)*0.5;
+  if(!player.laserFiring) player.laserCharge = Math.min(100, player.laserCharge + 2.5); // 撃破でOVERDRIVEゲージ上昇
   const pts = Math.floor(val*multiplier);
   score += pts;
   addExplosion(x,y,big);
@@ -1033,19 +1094,39 @@ function draw() {
     ctx.restore();
   });
 
-  // Laser beam
+  // Blink afterimage trails
+  blinkFx.forEach(a=>{
+    const al=a.life/a.maxLife;
+    ctx.save();ctx.globalAlpha=al*0.6;
+    ctx.strokeStyle='#a0f';ctx.lineWidth=6*al+1;ctx.shadowBlur=18;ctx.shadowColor='#a0f';
+    ctx.beginPath();ctx.moveTo(a.x1,a.y1);ctx.lineTo(a.x2,a.y2);ctx.stroke();
+    ctx.restore();
+  });
+
+  // Laser / OVERDRIVE beam
   if(laserBeam) {
     const alpha=laserBeam.life/laserBeam.maxLife;
-    [22,12,6].forEach((w,i)=>{
-      ctx.save();ctx.globalAlpha=(0.3-i*0.08)*alpha;
-      ctx.strokeStyle=i===0?'#f00':i===1?'#f88':'#fff';
-      ctx.lineWidth=w*alpha+1;ctx.shadowBlur=28;ctx.shadowColor='#f00';
-      ctx.beginPath();ctx.moveTo(laserBeam.x,laserBeam.y);ctx.lineTo(laserBeam.x,0);ctx.stroke();
-      ctx.restore();
-    });
+    if(laserBeam.special) {
+      // rainbow OVERDRIVE megabeam
+      [120,70,34,14].forEach((w,i)=>{
+        ctx.save();ctx.globalAlpha=(0.28-i*0.05);
+        ctx.strokeStyle=i===3?'#fff':`hsl(${(frame*8+i*60)%360},100%,65%)`;
+        ctx.lineWidth=w;ctx.shadowBlur=30;ctx.shadowColor='#0ff';
+        ctx.beginPath();ctx.moveTo(laserBeam.x,laserBeam.y);ctx.lineTo(laserBeam.x,0);ctx.stroke();
+        ctx.restore();
+      });
+    } else {
+      [22,12,6].forEach((w,i)=>{
+        ctx.save();ctx.globalAlpha=(0.3-i*0.08)*alpha;
+        ctx.strokeStyle=i===0?'#f00':i===1?'#f88':'#fff';
+        ctx.lineWidth=w*alpha+1;ctx.shadowBlur=28;ctx.shadowColor='#f00';
+        ctx.beginPath();ctx.moveTo(laserBeam.x,laserBeam.y);ctx.lineTo(laserBeam.x,0);ctx.stroke();
+        ctx.restore();
+      });
+    }
     ctx.save();ctx.globalAlpha=alpha*0.85;
-    ctx.fillStyle='#fff';ctx.shadowBlur=22;ctx.shadowColor='#f00';
-    ctx.beginPath();ctx.arc(laserBeam.x,4,5*alpha,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='#fff';ctx.shadowBlur=22;ctx.shadowColor=laserBeam.special?'#0ff':'#f00';
+    ctx.beginPath();ctx.arc(laserBeam.x,4,(laserBeam.special?9:5)*alpha,0,Math.PI*2);ctx.fill();
     ctx.restore();
   }
 
@@ -1138,6 +1219,29 @@ function draw() {
     ctx.restore();
   }
 
+  // OVERDRIVE aura + screen tint
+  if(overdriveTimer>0){
+    ctx.save();
+    ctx.globalAlpha=0.10+Math.sin(frame*0.3)*0.05;
+    ctx.fillStyle=`hsl(${frame*6%360},100%,55%)`;
+    ctx.fillRect(0,0,W,H);
+    ctx.restore();
+    ctx.save();
+    ctx.globalAlpha=0.6;ctx.strokeStyle=`hsl(${frame*9%360},100%,70%)`;
+    ctx.lineWidth=3;ctx.shadowBlur=24;ctx.shadowColor='#0ff';
+    ctx.beginPath();ctx.arc(player.x,player.y,40+Math.sin(frame*0.4)*6,0,Math.PI*2);ctx.stroke();
+    ctx.restore();
+  }
+
+  // Blink cooldown ring on player
+  if(blinkCooldown>0&&overdriveTimer<=0){
+    ctx.save();
+    const cp=1-blinkCooldown/75;
+    ctx.globalAlpha=0.5;ctx.strokeStyle='#a0f';ctx.lineWidth=2;ctx.shadowBlur=6;ctx.shadowColor='#a0f';
+    ctx.beginPath();ctx.arc(player.x,player.y+player.h/2+8,5,-Math.PI/2,-Math.PI/2+cp*Math.PI*2);ctx.stroke();
+    ctx.restore();
+  }
+
   // Danger vignette
   if(dangerMode){
     const v=ctx.createRadialGradient(W/2,H/2,H*0.18,W/2,H/2,H*0.8);
@@ -1177,9 +1281,9 @@ function draw() {
     ctx.restore();
   }
 
-  // Charge shot indicator
-  if(spaceHeld>10&&state==='play') {
-    const pct=Math.min(spaceHeld/90,1);
+  // Charge shot indicator (C key)
+  if(chargeHeld>10&&state==='play') {
+    const pct=Math.min(chargeHeld/90,1);
     ctx.save();
     ctx.strokeStyle=`hsl(${pct*180},100%,70%)`;
     ctx.lineWidth=3;ctx.shadowBlur=12;ctx.shadowColor=ctx.strokeStyle;
@@ -1455,16 +1559,17 @@ function drawHUD() {
   ctx.font='8px Courier New';ctx.fillStyle='#ff0';ctx.textAlign='center';ctx.shadowBlur=0;
   ctx.fillText('PWR',px2+pw/2,H-28);
 
-  // Laser bar
+  // OVERDRIVE (special) gauge bar
   const lx2=W/2+2, lw2=58;
   const lc=player.laserCharge/100;
-  ctx.fillStyle='rgba(255,0,0,0.1)';ctx.fillRect(lx2,H-24,lw2,ph2);
-  const lcolor=lc>=1?'#fff':`hsl(${lc*120},100%,60%)`;
+  ctx.fillStyle='rgba(0,255,255,0.1)';ctx.fillRect(lx2,H-24,lw2,ph2);
+  const lcolor=lc>=1?'#fff':`hsl(${180+lc*60},100%,60%)`;
   ctx.fillStyle=lcolor;ctx.shadowColor=lcolor;ctx.shadowBlur=lc>=1?16:5;
   ctx.fillRect(lx2,H-24,lw2*lc,ph2);
-  ctx.font='8px Courier New';ctx.fillStyle='#f88';ctx.textAlign='center';ctx.shadowBlur=0;
-  ctx.fillText('LASER',lx2+lw2/2,H-28);
-  if(lc>=1){ctx.fillStyle='#fff';ctx.shadowBlur=12;ctx.shadowColor='#f00';ctx.fillText('READY!',lx2+lw2/2,H-8);}
+  ctx.font='8px Courier New';ctx.fillStyle='#8ff';ctx.textAlign='center';ctx.shadowBlur=0;
+  ctx.fillText('SPECIAL',lx2+lw2/2,H-28);
+  if(overdriveTimer>0){ctx.fillStyle='#0ff';ctx.shadowBlur=12;ctx.shadowColor='#0ff';ctx.fillText('OVERDRIVE!',lx2+lw2/2,H-8);}
+  else if(lc>=1){ctx.fillStyle='#fff';ctx.shadowBlur=12;ctx.shadowColor='#0ff';ctx.fillText('Z:必殺技',lx2+lw2/2,H-8);}
 
   // Missiles
   if(player.homingMissiles>0){
@@ -1537,19 +1642,19 @@ function drawTitle() {
   ctx.fillText(`── ULTIMATE EDITION  v${VERSION} ──`,W/2,H/2-57);
 
   const features=[
-    '★ チェーンライトニング & タイムワープ',
+    '★ 必殺技 OVERDRIVE & ブリンク回避',
     '★ チャージショット & グレイズシステム',
-    '★ 11種の敵 & エンレイジボス',
-    '★ コンボ倍率 & シールド & ドローン'
+    '★ チェーンライトニング & タイムワープ',
+    '★ 11種の敵 & エンレイジボス'
   ];
   ctx.fillStyle='rgba(140,210,255,0.78)';ctx.font='11px Courier New';ctx.shadowBlur=0;
   features.forEach((f,i)=>ctx.fillText(f,W/2,H/2-30+i*17));
 
   ctx.fillStyle='#888';ctx.font='12px Courier New';
-  ctx.fillText('↑↓←→  移動',W/2,H/2+46);
-  ctx.fillText('SPACE (長押し)  チャージショット',W/2,H/2+62);
-  ctx.fillText('X / SHIFT  ボム / レーザー',W/2,H/2+78);
-  ctx.fillText('P / ESC  ポーズ',W/2,H/2+94);
+  ctx.fillText('↑↓←→  移動    SPACE / V  攻撃',W/2,H/2+44);
+  ctx.fillText('C (長押し)  チャージショット',W/2,H/2+60);
+  ctx.fillText('X  ブリンク回避    Z  必殺技 OVERDRIVE',W/2,H/2+76);
+  ctx.fillText('SHIFT  ボム      P / ESC  ポーズ',W/2,H/2+92);
 
   const blink=Math.sin(t*0.1)>0;
   ctx.fillStyle=blink?'#ff0':'#f80';
