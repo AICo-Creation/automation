@@ -678,7 +678,6 @@ function update() {
   if(player.homingMissiles>0 && missileCooldown<=0 && frame%26===0) fireMissile();
 
   // Move player bullets
-  const origBulletsLen = bullets.length;
   bullets = bullets.filter(b => {
     b.x += b.vx*dt; b.y += b.vy*dt;
     if(b.homing && b.target && (b.target===boss||enemies.includes(b.target))) {
@@ -691,6 +690,8 @@ function update() {
     return b.y>-80 && b.y<H+30 && b.x>-80 && b.x<W+80;
   });
   droneBullets = droneBullets.filter(b => { b.x+=b.vx*dt; b.y+=b.vy*dt; return b.y>-20; });
+  // capture AFTER off-screen filter so drone bullet indices into allPB are correct
+  const bulletsCount = bullets.length;
 
   // Laser beam damage
   if(laserBeam) {
@@ -730,13 +731,17 @@ function update() {
       if(e.teleTimer > 90) {
         e.teleTimer=0;
         e.lastX=e.x; e.lastY=e.y;
-        e.x = 20+Math.random()*(W-40);
-        e.y = Math.min(e.y, H-100);
+        // prevent teleporting on top of player
+        let nx, attempts=0;
+        do { nx=20+Math.random()*(W-40); attempts++; } while(Math.abs(nx-player.x)<60 && attempts<8);
+        e.x = nx;
+        e.y = Math.min(e.y, H-120);
         sndTeleport();
         addExplosion(e.lastX,e.lastY,false,'#d0f');
         addExplosion(e.x,e.y,false,'#d0f');
+        e.alpha = 0.1; // fade-in after teleport
       }
-      e.alpha = 0.3+Math.abs(Math.sin(frame*0.08))*0.7;
+      e.alpha = Math.min(1, (e.alpha||0.1)+0.04); // smooth fade-in, not instant solid
     } else if(e.type==='carrier') {
       e.y += espd*0.5;
       e.x += Math.sin(frame*0.02+e.x)*0.8*dt;
@@ -821,17 +826,18 @@ function update() {
       b.vx+=dx/d*0.12; b.vy+=dy/d*0.12;
       const sp=Math.hypot(b.vx,b.vy); if(sp>7){b.vx=b.vx/sp*7;b.vy=b.vy/sp*7;}
     }
-    // graze detection
+    // graze detection — only count once per bullet entry into graze zone
     if(player.invincible<=0) {
       const dist=Math.hypot(b.x-player.x,b.y-player.y);
-      if(dist<32 && dist>18) {
-        grazeScore+=2; totalGraze++;
-        score+=2;
-        if(frame%3===0) {
-          sndGraze();
-          particles.push({x:b.x,y:b.y,vx:randn(2),vy:randn(2),life:10,maxLife:10,color:'#ff0',size:2,type:'spark'});
-        }
+      const inZone = dist<30 && dist>12;
+      if(inZone && !b.grazed) {
+        b.grazed=true;
+        grazeScore+=5; totalGraze++;
+        score+=5;
+        sndGraze();
+        particles.push({x:b.x,y:b.y,vx:randn(2),vy:randn(2),life:14,maxLife:14,color:'#ff0',size:3,type:'spark'});
       }
+      if(!inZone) b.grazed=false;
     }
     return b.x>-20&&b.x<W+20&&b.y>-20&&b.y<H+20;
   });
@@ -871,20 +877,16 @@ function update() {
       }
     }
   });
-  // fix: filter using original indices correctly
   bullets = bullets.filter((_,i) => !hitSet.has(i));
-  droneBullets = droneBullets.filter((_,i) => !hitSet.has(origBulletsLen+i));
+  droneBullets = droneBullets.filter((_,i) => !hitSet.has(bulletsCount+i));
 
-  // Enemies exit bottom
-  enemies = enemies.filter(e => {
-    if(e.y>H+55) { loseLife(); addExplosion(e.x,H-10,false,'#f00'); return false; }
-    return true;
-  });
+  // Enemies exit bottom — just remove them, no life penalty (invisible hits feel unfair)
+  enemies = enemies.filter(e => e.y <= H+55);
 
-  // Enemy bullets vs player
+  // Enemy bullets vs player — margin=10 gives hitbox radius≈7px (tight cockpit area)
   if(player.invincible<=0) {
     eBullets = eBullets.filter(b => {
-      if(hitTest(b,player,6)) {
+      if(hitTest(b,player,10)) {
         if(player.shieldHp>0){ player.shieldHp--; sndHit(); screenFlash('#0ff',0.4); addExplosion(b.x,b.y,false,'#0ff'); }
         else loseLife();
         return false;
@@ -892,7 +894,7 @@ function update() {
       return true;
     });
     enemies = enemies.filter(e => {
-      if(hitTest(e,player,8)) {
+      if(hitTest(e,player,14)) {
         if(player.shieldHp>0){ player.shieldHp--; screenFlash('#0ff',0.4); }
         else loseLife();
         registerKill(e.x,e.y,e.scoreVal,false);
